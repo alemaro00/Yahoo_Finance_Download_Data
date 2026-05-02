@@ -11,8 +11,6 @@ import yfinance as yf
 TICKERS = ["SPY", "QQQ", "GLD", "AAPL", "MSFT", "NVDA", "EURUSD=X", "GBPUSD=X", "GC=F", "CL=F"]
 TARGET_TIMES_UTC = [dtime(hour, 30) for hour in (13, 14, 15, 16, 17, 18, 19)]
 
-DEFAULT_START_DATE = date(2024, 4, 29)
-DEFAULT_END_DATE = date(2026, 4, 29)
 INTERVAL = "60m"
 INTRADAY_RETENTION_DAYS = 730
 DEFAULT_WINDOW_DAYS = 730
@@ -25,13 +23,20 @@ def parse_date(value: str) -> date:
 	try:
 		return date.fromisoformat(value)
 	except ValueError as exc:
-		raise argparse.ArgumentTypeError(f"Data non valida: {value}. Usa YYYY-MM-DD") from exc
+		raise ValueError(f"Data non valida: {value}. Usa YYYY-MM-DD") from exc
+
+
+def parse_date_arg(value: str) -> date:
+	try:
+		return parse_date(value)
+	except ValueError as exc:
+		raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def parse_args() -> argparse.Namespace:
 	parser = argparse.ArgumentParser(description="Download Yahoo multi-finestra con output Pre_clean/Post_clean in UTC")
-	parser.add_argument("--start-date", type=parse_date, default=DEFAULT_START_DATE, help="Data inizio (YYYY-MM-DD)")
-	parser.add_argument("--end-date", type=parse_date, default=DEFAULT_END_DATE, help="Data fine (YYYY-MM-DD)")
+	parser.add_argument("--start-date", type=parse_date_arg, default=None, help="Data inizio (YYYY-MM-DD)")
+	parser.add_argument("--end-date", type=parse_date_arg, default=None, help="Data fine (YYYY-MM-DD)")
 	parser.add_argument(
 		"--window-days",
 		type=int,
@@ -40,12 +45,42 @@ def parse_args() -> argparse.Namespace:
 	)
 
 	args = parser.parse_args()
-	if args.start_date > args.end_date:
-		parser.error("start-date deve essere <= end-date")
 	if args.window_days < 1:
 		parser.error("window-days deve essere >= 1")
 
 	return args
+
+
+def select_date_range(start_arg: date | None, end_arg: date | None) -> tuple[date, date]:
+	today_utc = datetime.now(UTC).date()
+	default_start = today_utc - timedelta(days=INTRADAY_RETENTION_DAYS)
+	default_end = today_utc
+
+	if start_arg is None and end_arg is None:
+		print(f"Se non inserisci nulla, uso default: {default_start} -> {default_end} (UTC)")
+		start_raw = input(f"Data start [YYYY-MM-DD] (invio={default_start}): ").strip()
+		end_raw = input(f"Data end   [YYYY-MM-DD] (invio={default_end}): ").strip()
+
+		if not start_raw and not end_raw:
+			start_date, end_date = default_start, default_end
+		elif start_raw and end_raw:
+			start_date, end_date = parse_date(start_raw), parse_date(end_raw)
+		else:
+			raise ValueError("Inserisci entrambe le date oppure lascia entrambe vuote.")
+	elif start_arg is not None and end_arg is not None:
+		start_date, end_date = start_arg, end_arg
+	else:
+		raise ValueError("Passa sia --start-date che --end-date, oppure nessuno dei due.")
+
+	if start_date > end_date:
+		raise ValueError("La data start deve essere <= data end.")
+
+	if start_date < default_start or end_date > default_end:
+		raise ValueError(
+			f"Intervallo non valido: scegli date tra {default_start} e {default_end} (UTC)."
+		)
+
+	return start_date, end_date
 
 
 def iter_windows(start_date: date, end_date: date, window_days: int):
@@ -97,7 +132,8 @@ def fetch_close_window_with_retry(window_start: date, window_end: date) -> pd.Da
 
 			close = extract_close_from_download(raw)
 			if close.empty:
-				raise ValueError("download vuoto")
+				print(f"Nessun dato per la finestra {window_start} -> {window_end}, salto.")
+				return pd.DataFrame(columns=TICKERS)
 
 			return close
 		except Exception as exc:
@@ -182,29 +218,36 @@ def render_table_text(df: pd.DataFrame, title: str) -> str:
 
 def main() -> None:
 	args = parse_args()
-	target_index = build_target_index(args.start_date, args.end_date)
-	output = pd.DataFrame(index=target_index)
-	effective_start = args.start_date
-	if INTERVAL.endswith("m") or INTERVAL.endswith("h"):
-		retention_floor = datetime.now(UTC).date() - timedelta(days=INTRADAY_RETENTION_DAYS - 1)
-		if effective_start < retention_floor:
-			print(
-				f"Nota: Yahoo limita {INTERVAL} agli ultimi {INTRADAY_RETENTION_DAYS} giorni. "
-				f"Inizio effettivo download: {retention_floor}"
-			)
-			effective_start = retention_floor
+	try:
+		start_date, end_date = select_date_range(args.start_date, args.end_date)
+	except ValueError as exc:
+		print(f"Errore: {exc}")
+		raise SystemExit(1)
 
-	if effective_start > args.end_date:
+	target_index = build_target_index(start_date, end_date)
+	output = pd.DataFrame(index=target_index)
+	effective_start = start_date
+	if INTERVAL.endswith("m") or INTERVAL.endswith("h"):
+		# Yahoo often rejects the exact 730-day boundary for intraday; use a safe floor.
+		safe_retention_floor = datetime.now(UTC).date() - timedelta(days=INTRADAY_RETENTION_DAYS - 1)
+		if effective_start < safe_retention_floor:
+			print(
+				f"Nota: per {INTERVAL} Yahoo usa una finestra effettiva leggermente piu stretta. "
+				f"Inizio download effettivo: {safe_retention_floor}"
+			)
+			effective_start = safe_retention_floor
+
+	if effective_start > end_date:
 		close = pd.DataFrame(columns=TICKERS)
 	else:
-		close = fetch_all_close_chunked(effective_start, args.end_date, args.window_days)
+		close = fetch_all_close_chunked(effective_start, end_date, args.window_days)
 
 	for symbol in TICKERS:
 		series = close[symbol] if symbol in close.columns else pd.Series(dtype="float64")
 		output[symbol] = normalize_symbol_close(series, target_index)
 
 	DATA_DIR.mkdir(parents=True, exist_ok=True)
-	pre_clean_file, post_clean_file = build_output_paths(args.start_date, args.end_date)
+	pre_clean_file, post_clean_file = build_output_paths(start_date, end_date)
 
 	output_to_save = output.reset_index()
 	output_to_save = output_to_save.rename(columns={"timestamp_utc": "datetime_utc"})
