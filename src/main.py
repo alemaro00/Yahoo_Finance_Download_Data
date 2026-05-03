@@ -10,7 +10,6 @@ import yfinance as yf
 
 TICKERS = ["JPY=X", "GBPUSD=X", "AUDUSD=X", "NZDUSD=X", "EURCHF=X", "EURCAD=X", "EURUSD=X", "EURSEK=X", "EURHUF=X", "HKD=X"]
 TARGET_TIMES_UTC = [dtime(hour, 30) for hour in (13, 14, 15, 16, 17, 18, 19)]
-DAILY_REFERENCE_TIME_UTC = dtime(15, 30)
 
 INTRADAY_INTERVALS = {"1m", "2m", "5m", "15m", "30m", "60m", "90m"}
 SUPPORTED_INTERVALS = INTRADAY_INTERVALS | {"1d", "5d", "1wk", "1mo", "3mo"}
@@ -281,126 +280,6 @@ def normalize_symbol_close(series: pd.Series, interval: str, target_index: pd.Da
 	return clean.reindex(target_index)
 
 
-def build_daily_reference_index(start_date: date, end_date: date) -> pd.DatetimeIndex:
-	return pd.DatetimeIndex(
-		[
-			pd.Timestamp(datetime.combine(day, DAILY_REFERENCE_TIME_UTC), tz="UTC")
-			for day in pd.date_range(start_date, end_date, freq="B").date
-		],
-		name="timestamp_utc",
-	)
-
-
-def normalize_daily_bar_to_reference(series: pd.Series, target_index: pd.DatetimeIndex) -> pd.Series:
-	if target_index.empty:
-		return pd.Series(index=target_index, dtype="float64")
-
-	clean = series.dropna().copy()
-	if clean.empty:
-		return pd.Series(index=target_index, dtype="float64")
-
-	idx = pd.DatetimeIndex(clean.index)
-	idx = idx.tz_localize("UTC") if idx.tz is None else idx.tz_convert("UTC")
-	clean.index = pd.DatetimeIndex(
-		[pd.Timestamp(datetime.combine(ts.date(), DAILY_REFERENCE_TIME_UTC), tz="UTC") for ts in idx],
-		name="timestamp_utc",
-	)
-	clean = clean[~clean.index.duplicated(keep="last")]
-	return clean.reindex(target_index)
-
-
-def normalize_intraday_to_daily_reference(series: pd.Series, interval: str, target_index: pd.DatetimeIndex) -> pd.Series:
-	if target_index.empty:
-		return pd.Series(index=target_index, dtype="float64")
-
-	clean = series.dropna().copy()
-	if clean.empty:
-		return pd.Series(index=target_index, dtype="float64")
-
-	idx = pd.DatetimeIndex(clean.index)
-	idx = idx.tz_localize("UTC") if idx.tz is None else idx.tz_convert("UTC")
-	clean.index = idx
-
-	minute_mode = int(clean.index.minute.to_series().mode().iloc[0])
-	if interval == "60m" and minute_mode == 0:
-		clean.index = clean.index + pd.Timedelta(minutes=30)
-
-	selected_values: list[float] = []
-	selected_index: list[pd.Timestamp] = []
-	for target_ts in target_index:
-		day_rows = clean[(clean.index.date == target_ts.date()) & (clean.index >= target_ts)]
-		if day_rows.empty:
-			continue
-		selected_index.append(target_ts)
-		selected_values.append(float(day_rows.iloc[0]))
-
-	if not selected_values:
-		return pd.Series(index=target_index, dtype="float64")
-
-	result = pd.Series(
-		selected_values,
-		index=pd.DatetimeIndex(selected_index, name="timestamp_utc", tz="UTC"),
-		dtype="float64",
-	)
-	result = result[~result.index.duplicated(keep="last")]
-	return result.reindex(target_index)
-
-
-def build_daily_1530_hybrid_dataset(
-	start_date: date,
-	end_date: date,
-	window_days: int,
-) -> tuple[pd.DatetimeIndex, dict[str, pd.Series], list[dict[str, str | int]], date]:
-	target_index = build_daily_reference_index(start_date, end_date)
-	intraday_floor = datetime.now(UTC).date() - timedelta(days=INTRADAY_RETENTION_DAYS - 1)
-	older_end = min(end_date, intraday_floor - timedelta(days=1))
-	recent_start = max(start_date, intraday_floor)
-
-	has_older = start_date <= older_end
-	has_recent = recent_start <= end_date
-
-	older_close = (
-		fetch_all_close_chunked(start_date, older_end, window_days, "1d") if has_older else pd.DataFrame(columns=TICKERS)
-	)
-	recent_close = (
-		fetch_all_close_chunked(recent_start, end_date, window_days, "60m") if has_recent else pd.DataFrame(columns=TICKERS)
-	)
-
-	empty_target_index = pd.DatetimeIndex([], name="timestamp_utc", tz="UTC")
-	older_target_index = target_index[target_index.date <= older_end] if has_older else empty_target_index
-	recent_target_index = target_index[target_index.date >= recent_start] if has_recent else empty_target_index
-
-	normalized_by_symbol: dict[str, pd.Series] = {}
-	symbol_rows: list[dict[str, str | int]] = []
-	for symbol in TICKERS:
-		older_raw = older_close[symbol] if symbol in older_close.columns else pd.Series(dtype="float64")
-		recent_raw = recent_close[symbol] if symbol in recent_close.columns else pd.Series(dtype="float64")
-
-		older_norm = normalize_daily_bar_to_reference(older_raw, older_target_index)
-		recent_norm = normalize_intraday_to_daily_reference(recent_raw, "60m", recent_target_index)
-
-		combined = pd.concat([older_norm.dropna(), recent_norm.dropna()]).sort_index()
-		combined = combined[~combined.index.duplicated(keep="last")]
-		normalized = combined.reindex(target_index)
-		normalized_by_symbol[symbol] = normalized
-
-		available = normalized.dropna()
-		source_tz = f"hybrid_1d:{detect_source_timezone(older_raw)}|60m:{detect_source_timezone(recent_raw)}"
-		symbol_rows.append(
-			{
-				"ticker": symbol,
-				"source_tz": source_tz,
-				"rows": int(len(available)),
-				"exact_1530_rows": int(recent_norm.notna().sum()),
-				"proxy_1d_rows": int(older_norm.notna().sum()),
-				"first_utc": format_ts(available.index.min() if not available.empty else None),
-				"last_utc": format_ts(available.index.max() if not available.empty else None),
-			}
-		)
-
-	return target_index, normalized_by_symbol, symbol_rows, intraday_floor
-
-
 def build_intraday_target_index(start_date: date, end_date: date) -> pd.DatetimeIndex:
 	return pd.DatetimeIndex(
 		[
@@ -455,18 +334,15 @@ def render_timezone_sync_report(
 	symbol_rows: list[dict[str, str | int]],
 	pre_rows: int,
 	post_rows: int,
-	report_note: str | None = None,
 ) -> str:
 	report_df = pd.DataFrame(symbol_rows)
 	report_table = report_df.to_string(index=False)
 	status = "SYNC_OK" if post_rows > 0 else "NO_COMMON_TIMESTAMPS"
-	note_line = f"note: {report_note}\n" if report_note else ""
 	return (
 		"# Timezone_and_Synchronization_Report\n"
 		f"interval: {interval}\n"
 		f"requested_range: {requested_start} -> {requested_end}\n"
 		f"effective_download_start: {effective_start}\n"
-		f"{note_line}"
 		f"pre_clean_rows: {pre_rows}\n"
 		f"post_clean_rows: {post_rows}\n"
 		f"strict_sync_status: {status}\n"
@@ -495,59 +371,40 @@ def main() -> None:
 		print(f"Errore: {exc}")
 		raise SystemExit(1)
 
+	target_index = build_intraday_target_index(start_date, end_date) if is_intraday_interval(interval) else None
+
+	effective_start, clipped_floor = clamp_start_for_retention(start_date, interval)
+	if clipped_floor is not None:
+		print(
+			f"Nota: per {interval} Yahoo usa una finestra effettiva leggermente piu stretta. "
+			f"Inizio download effettivo: {clipped_floor}"
+		)
+
+	if effective_start > end_date:
+		close = pd.DataFrame(columns=TICKERS)
+	else:
+		close = fetch_all_close_chunked(effective_start, end_date, args.window_days, interval)
+
 	normalized_by_symbol: dict[str, pd.Series] = {}
 	symbol_rows: list[dict[str, str | int]] = []
-	report_note: str | None = None
+	for symbol in TICKERS:
+		raw_series = close[symbol] if symbol in close.columns else pd.Series(dtype="float64")
+		normalized = normalize_symbol_close(raw_series, interval, target_index)
+		normalized_by_symbol[symbol] = normalized
 
-	if interval == "1d":
-		target_index, normalized_by_symbol, symbol_rows, intraday_floor = build_daily_1530_hybrid_dataset(
-			start_date=start_date,
-			end_date=end_date,
-			window_days=args.window_days,
+		available = normalized.dropna()
+		symbol_rows.append(
+			{
+				"ticker": symbol,
+				"source_tz": detect_source_timezone(raw_series),
+				"rows": int(len(available)),
+				"first_utc": format_ts(available.index.min() if not available.empty else None),
+				"last_utc": format_ts(available.index.max() if not available.empty else None),
+			}
 		)
-		effective_start = start_date
-		report_note = (
-			f"1d uses hybrid policy: <= recent retention exact@15:30 from 60m, "
-			f"older dates proxy from native 1d; intraday_floor={intraday_floor}"
-		)
-		if start_date < intraday_floor:
-			print(
-				"Nota 1d@15:30: storico precedente al limite intraday Yahoo "
-				f"({intraday_floor}) riempito con proxy da barre giornaliere 1d."
-			)
-	else:
-		target_index = build_intraday_target_index(start_date, end_date) if is_intraday_interval(interval) else None
 
-		effective_start, clipped_floor = clamp_start_for_retention(start_date, interval)
-		if clipped_floor is not None:
-			print(
-				f"Nota: per {interval} Yahoo usa una finestra effettiva leggermente piu stretta. "
-				f"Inizio download effettivo: {clipped_floor}"
-			)
-
-		if effective_start > end_date:
-			close = pd.DataFrame(columns=TICKERS)
-		else:
-			close = fetch_all_close_chunked(effective_start, end_date, args.window_days, interval)
-
-		for symbol in TICKERS:
-			raw_series = close[symbol] if symbol in close.columns else pd.Series(dtype="float64")
-			normalized = normalize_symbol_close(raw_series, interval, target_index)
-			normalized_by_symbol[symbol] = normalized
-
-			available = normalized.dropna()
-			symbol_rows.append(
-				{
-					"ticker": symbol,
-					"source_tz": detect_source_timezone(raw_series),
-					"rows": int(len(available)),
-					"first_utc": format_ts(available.index.min() if not available.empty else None),
-					"last_utc": format_ts(available.index.max() if not available.empty else None),
-				}
-			)
-
-		if target_index is None:
-			target_index = build_union_index(normalized_by_symbol)
+	if target_index is None:
+		target_index = build_union_index(normalized_by_symbol)
 
 	output = pd.DataFrame(index=target_index)
 
@@ -577,7 +434,6 @@ def main() -> None:
 			symbol_rows=symbol_rows,
 			pre_rows=len(pre_clean_df),
 			post_rows=len(post_clean_df),
-			report_note=report_note,
 		),
 		encoding="utf-8",
 	)
