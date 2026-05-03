@@ -8,7 +8,7 @@ from pathlib import Path
 import pandas as pd
 import yfinance as yf
 
-TICKERS = ["SPY", "QQQ", "GLD", "AAPL", "MSFT", "NVDA", "EURUSD=X", "GBPUSD=X", "GC=F", "CL=F"]
+TICKERS = ["SPY", "QQQ", "XRP-USD", "AAPL", "MSFT", "NVDA", "EURUSD=X", "GBPUSD=X", "GC=F", "BTC-USD"]
 TARGET_TIMES_UTC = [dtime(hour, 30) for hour in (13, 14, 15, 16, 17, 18, 19)]
 
 INTERVAL = "60m"
