@@ -8,7 +8,8 @@ from pathlib import Path
 import pandas as pd
 import yfinance as yf
 
-TICKERS = ["JPY=X", "GBPUSD=X", "AUDUSD=X", "NZDUSD=X", "EURCHF=X", "EURCAD=X", "EURUSD=X", "EURSEK=X", "EURHUF=X", "HKD=X"]
+TICKERS = ["BTC-USD", "ETH-USD", "USDT-USD", "XRP-USD", "BNB-USD", "BCH-USD", "DOGE-USD", "TRX-USD"]
+        #["JPY=X", "GBPUSD=X", "AUDUSD=X", "NZDUSD=X", "EURCHF=X", "EURCAD=X", "EURUSD=X", "EURSEK=X", "EURHUF=X", "HKD=X"]
 TARGET_TIMES_UTC = [dtime(hour, 30) for hour in (13, 14, 15, 16, 17, 18, 19)]
 
 INTRADAY_INTERVALS = {"1m", "2m", "5m", "15m", "30m", "60m", "90m"}
