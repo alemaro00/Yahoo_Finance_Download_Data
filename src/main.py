@@ -21,6 +21,12 @@ DEFAULT_WINDOW_DAYS = 730
 MAX_RETRIES = 4
 DATA_DIR = Path("data")
 TARGET_TIMES_HHMM = {item.strftime("%H:%M") for item in TARGET_TIMES_UTC}
+CLOSE_COLUMNS = [f"{symbol}_close" for symbol in TICKERS]
+HIGH_COLUMNS = [f"{symbol}_high" for symbol in TICKERS]
+LOW_COLUMNS = [f"{symbol}_low" for symbol in TICKERS]
+VOLUME_COLUMNS = [f"{symbol}_volume" for symbol in TICKERS]
+SUPPORTED_OUTPUT_FIELDS = ("close", "high", "low", "volume")
+RETENTION_SAFETY_BUFFER_DAYS = 1
 INTERVAL_RETENTION_DAYS: dict[str, int | None] = {
 	"1m": 7,
 	"2m": 60,
@@ -51,6 +57,46 @@ def parse_date_arg(value: str) -> date:
 		raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
+def parse_output_fields(value: str) -> tuple[str, ...]:
+	fields = [item.strip().lower() for item in value.split(",") if item.strip()]
+	if not fields:
+		raise ValueError("fields non puo essere vuoto. Usa almeno un campo.")
+
+	invalid = sorted(set(fields) - set(SUPPORTED_OUTPUT_FIELDS))
+	if invalid:
+		raise ValueError(
+			f"Campi non validi: {', '.join(invalid)}. Valori ammessi: {', '.join(SUPPORTED_OUTPUT_FIELDS)}"
+		)
+
+	seen: set[str] = set()
+	ordered_unique: list[str] = []
+	for field in fields:
+		if field not in seen:
+			seen.add(field)
+			ordered_unique.append(field)
+
+	return tuple(ordered_unique)
+
+
+def select_output_fields(fields_arg: tuple[str, ...] | None) -> tuple[str, ...]:
+	if fields_arg is not None:
+		return fields_arg
+
+	default_fields = ",".join(SUPPORTED_OUTPUT_FIELDS)
+	try:
+		raw = input(
+			f"Campi output [{'/'.join(SUPPORTED_OUTPUT_FIELDS)}] separati da virgola "
+			f"(invio={default_fields}): "
+		).strip()
+	except EOFError:
+		raw = ""
+
+	if not raw:
+		return SUPPORTED_OUTPUT_FIELDS
+
+	return parse_output_fields(raw)
+
+
 def parse_args() -> argparse.Namespace:
 	parser = argparse.ArgumentParser(description="Download Yahoo multi-finestra con output Pre_clean/Post_clean in UTC")
 	parser.add_argument(
@@ -67,10 +113,26 @@ def parse_args() -> argparse.Namespace:
 		default=DEFAULT_WINDOW_DAYS,
 		help="Dimensione finestra per download annidato (es. 730)",
 	)
+	parser.add_argument(
+		"--fields",
+		type=str,
+		default=None,
+		help=(
+			"Campi output separati da virgola. "
+			f"Valori: {', '.join(SUPPORTED_OUTPUT_FIELDS)}. "
+			"Se omesso, li chiede in modo interattivo."
+		),
+	)
 
 	args = parser.parse_args()
 	if args.window_days < 1:
 		parser.error("window-days deve essere >= 1")
+
+	if args.fields is not None:
+		try:
+			args.fields = parse_output_fields(args.fields)
+		except ValueError as exc:
+			parser.error(str(exc))
 
 	return args
 
@@ -95,7 +157,8 @@ def clamp_start_for_retention(start_date: date, interval: str) -> tuple[date, da
 	if retention_days is None:
 		return start_date, None
 
-	safe_floor = datetime.now(UTC).date() - timedelta(days=retention_days - 1)
+	safe_window_days = max(retention_days - RETENTION_SAFETY_BUFFER_DAYS, 1)
+	safe_floor = datetime.now(UTC).date() - timedelta(days=safe_window_days - 1)
 	if start_date < safe_floor:
 		return safe_floor, safe_floor
 
@@ -134,12 +197,8 @@ def select_date_range(start_arg: date | None, end_arg: date | None, interval: st
 		except EOFError:
 			start_raw, end_raw = "", ""
 
-		if not start_raw and not end_raw:
-			start_date, end_date = default_start, default_end
-		elif start_raw and end_raw:
-			start_date, end_date = parse_date(start_raw), parse_date(end_raw)
-		else:
-			raise ValueError("Inserisci entrambe le date oppure lascia entrambe vuote.")
+		start_date = parse_date(start_raw) if start_raw else default_start
+		end_date = parse_date(end_raw) if end_raw else default_end
 	elif start_arg is not None and end_arg is not None:
 		start_date, end_date = start_arg, end_arg
 	else:
@@ -167,28 +226,46 @@ def iter_windows(start_date: date, end_date: date, window_days: int):
 		window_start = window_end + timedelta(days=1)
 
 
-def extract_close_from_download(raw: pd.DataFrame) -> pd.DataFrame:
+def extract_field_from_download(raw: pd.DataFrame, field_name: str) -> pd.DataFrame:
 	if raw.empty:
 		return pd.DataFrame(columns=TICKERS)
 
 	if isinstance(raw.columns, pd.MultiIndex):
-		if "Close" not in raw.columns.get_level_values(0):
+		if field_name not in raw.columns.get_level_values(0):
 			return pd.DataFrame(columns=TICKERS)
-		close = raw["Close"]
+		field_df = raw[field_name]
 	else:
-		if "Close" not in raw.columns:
+		if field_name not in raw.columns:
 			return pd.DataFrame(columns=TICKERS)
-		close = raw[["Close"]]
+		field_df = raw[[field_name]]
 
-	if isinstance(close, pd.Series):
-		close = close.to_frame(name=TICKERS[0])
-	if "Close" in close.columns:
-		close = close.rename(columns={"Close": TICKERS[0]})
+	if isinstance(field_df, pd.Series):
+		field_df = field_df.to_frame(name=TICKERS[0])
+	if field_name in field_df.columns:
+		field_df = field_df.rename(columns={field_name: TICKERS[0]})
 
-	return close
+	return field_df
 
 
-def fetch_close_window_with_retry(window_start: date, window_end: date, interval: str) -> pd.DataFrame:
+def merge_symbol_chunks(chunks: list[pd.DataFrame]) -> pd.DataFrame:
+	if not chunks:
+		return pd.DataFrame(columns=TICKERS)
+
+	merged = pd.concat(chunks)
+	merged = merged[~merged.index.duplicated(keep="last")].sort_index()
+
+	for symbol in TICKERS:
+		if symbol not in merged.columns:
+			merged[symbol] = pd.NA
+
+	return merged[TICKERS]
+
+
+def fetch_ohlcv_window_with_retry(
+	window_start: date,
+	window_end: date,
+	interval: str,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
 	end_exclusive = window_end + timedelta(days=1)
 	tickers_string = " ".join(TICKERS)
 
@@ -206,16 +283,29 @@ def fetch_close_window_with_retry(window_start: date, window_end: date, interval
 				progress=False,
 			)
 
-			close = extract_close_from_download(raw)
-			if close.empty:
+			close = extract_field_from_download(raw, "Close")
+			high = extract_field_from_download(raw, "High")
+			low = extract_field_from_download(raw, "Low")
+			volume = extract_field_from_download(raw, "Volume")
+			if close.empty and high.empty and low.empty and volume.empty:
 				print(f"Nessun dato per la finestra {window_start} -> {window_end}, salto.")
-				return pd.DataFrame(columns=TICKERS)
+				return (
+					pd.DataFrame(columns=TICKERS),
+					pd.DataFrame(columns=TICKERS),
+					pd.DataFrame(columns=TICKERS),
+					pd.DataFrame(columns=TICKERS),
+				)
 
-			return close
+			return close, high, low, volume
 		except Exception as exc:
 			if attempt == MAX_RETRIES:
 				print(f"Finestra {window_start} -> {window_end} fallita: {exc}")
-				return pd.DataFrame(columns=TICKERS)
+				return (
+					pd.DataFrame(columns=TICKERS),
+					pd.DataFrame(columns=TICKERS),
+					pd.DataFrame(columns=TICKERS),
+					pd.DataFrame(columns=TICKERS),
+				)
 
 			wait_seconds = 2**attempt
 			print(
@@ -224,33 +314,47 @@ def fetch_close_window_with_retry(window_start: date, window_end: date, interval
 			)
 			time.sleep(wait_seconds)
 
-	return pd.DataFrame(columns=TICKERS)
+	return (
+		pd.DataFrame(columns=TICKERS),
+		pd.DataFrame(columns=TICKERS),
+		pd.DataFrame(columns=TICKERS),
+		pd.DataFrame(columns=TICKERS),
+	)
 
 
-def fetch_all_close_chunked(start_date: date, end_date: date, window_days: int, interval: str) -> pd.DataFrame:
+def fetch_all_ohlcv_chunked(
+	start_date: date,
+	end_date: date,
+	window_days: int,
+	interval: str,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
 	windows = list(iter_windows(start_date, end_date, window_days))
-	chunks: list[pd.DataFrame] = []
+	close_chunks: list[pd.DataFrame] = []
+	high_chunks: list[pd.DataFrame] = []
+	low_chunks: list[pd.DataFrame] = []
+	volume_chunks: list[pd.DataFrame] = []
 
 	for idx, (window_start, window_end) in enumerate(windows, start=1):
 		print(f"Scarico finestra {idx}/{len(windows)}: {window_start} -> {window_end}")
-		chunk = fetch_close_window_with_retry(window_start, window_end, interval)
-		if not chunk.empty:
-			chunks.append(chunk)
+		close_chunk, high_chunk, low_chunk, volume_chunk = fetch_ohlcv_window_with_retry(window_start, window_end, interval)
+		if not close_chunk.empty:
+			close_chunks.append(close_chunk)
+		if not high_chunk.empty:
+			high_chunks.append(high_chunk)
+		if not low_chunk.empty:
+			low_chunks.append(low_chunk)
+		if not volume_chunk.empty:
+			volume_chunks.append(volume_chunk)
 
-	if not chunks:
-		return pd.DataFrame(columns=TICKERS)
-
-	merged = pd.concat(chunks)
-	merged = merged[~merged.index.duplicated(keep="last")].sort_index()
-
-	for symbol in TICKERS:
-		if symbol not in merged.columns:
-			merged[symbol] = pd.NA
-
-	return merged[TICKERS]
+	return (
+		merge_symbol_chunks(close_chunks),
+		merge_symbol_chunks(high_chunks),
+		merge_symbol_chunks(low_chunks),
+		merge_symbol_chunks(volume_chunks),
+	)
 
 
-def normalize_symbol_close(series: pd.Series, interval: str, target_index: pd.DatetimeIndex | None = None) -> pd.Series:
+def normalize_symbol_series(series: pd.Series, interval: str, target_index: pd.DatetimeIndex | None = None) -> pd.Series:
 	clean = series.dropna().copy()
 	if clean.empty:
 		if target_index is None:
@@ -367,6 +471,12 @@ def main() -> None:
 		raise SystemExit(1)
 
 	try:
+		selected_fields = select_output_fields(args.fields)
+	except ValueError as exc:
+		print(f"Errore: {exc}")
+		raise SystemExit(1)
+
+	try:
 		start_date, end_date = select_date_range(args.start_date, args.end_date, interval)
 	except ValueError as exc:
 		print(f"Errore: {exc}")
@@ -383,34 +493,74 @@ def main() -> None:
 
 	if effective_start > end_date:
 		close = pd.DataFrame(columns=TICKERS)
+		high = pd.DataFrame(columns=TICKERS)
+		low = pd.DataFrame(columns=TICKERS)
+		volume = pd.DataFrame(columns=TICKERS)
 	else:
-		close = fetch_all_close_chunked(effective_start, end_date, args.window_days, interval)
+		close, high, low, volume = fetch_all_ohlcv_chunked(effective_start, end_date, args.window_days, interval)
 
-	normalized_by_symbol: dict[str, pd.Series] = {}
+	normalized_close_by_symbol: dict[str, pd.Series] = {}
+	normalized_high_by_symbol: dict[str, pd.Series] = {}
+	normalized_low_by_symbol: dict[str, pd.Series] = {}
+	normalized_volume_by_symbol: dict[str, pd.Series] = {}
 	symbol_rows: list[dict[str, str | int]] = []
 	for symbol in TICKERS:
-		raw_series = close[symbol] if symbol in close.columns else pd.Series(dtype="float64")
-		normalized = normalize_symbol_close(raw_series, interval, target_index)
-		normalized_by_symbol[symbol] = normalized
+		raw_close = close[symbol] if symbol in close.columns else pd.Series(dtype="float64")
+		raw_high = high[symbol] if symbol in high.columns else pd.Series(dtype="float64")
+		raw_low = low[symbol] if symbol in low.columns else pd.Series(dtype="float64")
+		raw_volume = volume[symbol] if symbol in volume.columns else pd.Series(dtype="float64")
 
-		available = normalized.dropna()
+		normalized_close = normalize_symbol_series(raw_close, interval, target_index)
+		normalized_high = normalize_symbol_series(raw_high, interval, target_index)
+		normalized_low = normalize_symbol_series(raw_low, interval, target_index)
+		normalized_volume = normalize_symbol_series(raw_volume, interval, target_index)
+		normalized_close_by_symbol[symbol] = normalized_close
+		normalized_high_by_symbol[symbol] = normalized_high
+		normalized_low_by_symbol[symbol] = normalized_low
+		normalized_volume_by_symbol[symbol] = normalized_volume
+
+		available_close = normalized_close.dropna()
+		available_high = normalized_high.dropna()
+		available_low = normalized_low.dropna()
+		available_volume = normalized_volume.dropna()
 		symbol_rows.append(
 			{
 				"ticker": symbol,
-				"source_tz": detect_source_timezone(raw_series),
-				"rows": int(len(available)),
-				"first_utc": format_ts(available.index.min() if not available.empty else None),
-				"last_utc": format_ts(available.index.max() if not available.empty else None),
+				"source_tz_close": detect_source_timezone(raw_close),
+				"source_tz_high": detect_source_timezone(raw_high),
+				"source_tz_low": detect_source_timezone(raw_low),
+				"source_tz_volume": detect_source_timezone(raw_volume),
+				"rows_close": int(len(available_close)),
+				"first_utc_close": format_ts(available_close.index.min() if not available_close.empty else None),
+				"last_utc_close": format_ts(available_close.index.max() if not available_close.empty else None),
+				"rows_high": int(len(available_high)),
+				"first_utc_high": format_ts(available_high.index.min() if not available_high.empty else None),
+				"last_utc_high": format_ts(available_high.index.max() if not available_high.empty else None),
+				"rows_low": int(len(available_low)),
+				"first_utc_low": format_ts(available_low.index.min() if not available_low.empty else None),
+				"last_utc_low": format_ts(available_low.index.max() if not available_low.empty else None),
+				"rows_volume": int(len(available_volume)),
+				"first_utc_volume": format_ts(available_volume.index.min() if not available_volume.empty else None),
+				"last_utc_volume": format_ts(available_volume.index.max() if not available_volume.empty else None),
 			}
 		)
 
 	if target_index is None:
-		target_index = build_union_index(normalized_by_symbol)
+		combined_series: dict[str, pd.Series] = {}
+		for symbol in TICKERS:
+			combined_series[f"{symbol}_close"] = normalized_close_by_symbol[symbol]
+			combined_series[f"{symbol}_high"] = normalized_high_by_symbol[symbol]
+			combined_series[f"{symbol}_low"] = normalized_low_by_symbol[symbol]
+			combined_series[f"{symbol}_volume"] = normalized_volume_by_symbol[symbol]
+		target_index = build_union_index(combined_series)
 
 	output = pd.DataFrame(index=target_index)
 
 	for symbol in TICKERS:
-		output[symbol] = normalized_by_symbol[symbol].reindex(target_index)
+		output[f"{symbol}_close"] = normalized_close_by_symbol[symbol].reindex(target_index)
+		output[f"{symbol}_high"] = normalized_high_by_symbol[symbol].reindex(target_index)
+		output[f"{symbol}_low"] = normalized_low_by_symbol[symbol].reindex(target_index)
+		output[f"{symbol}_volume"] = normalized_volume_by_symbol[symbol].reindex(target_index)
 
 	DATA_DIR.mkdir(parents=True, exist_ok=True)
 	pre_clean_file, post_clean_file, report_file = build_output_paths(start_date, end_date)
@@ -418,11 +568,25 @@ def main() -> None:
 	output_to_save = output.reset_index()
 	output_to_save = output_to_save.rename(columns={"timestamp_utc": "datetime_utc"})
 	output_to_save["datetime_utc"] = output_to_save["datetime_utc"].dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-	output_to_save[TICKERS] = output_to_save[TICKERS].round(6)
-	output_to_save = output_to_save.dropna(subset=TICKERS, how="all")
+	price_columns = CLOSE_COLUMNS + HIGH_COLUMNS + LOW_COLUMNS
+	output_to_save[price_columns] = output_to_save[price_columns].round(6)
+	output_to_save[VOLUME_COLUMNS] = output_to_save[VOLUME_COLUMNS].round(0)
+	field_columns_map = {
+		"close": CLOSE_COLUMNS,
+		"high": HIGH_COLUMNS,
+		"low": LOW_COLUMNS,
+		"volume": VOLUME_COLUMNS,
+	}
+	selected_columns: list[str] = []
+	for field in selected_fields:
+		selected_columns.extend(field_columns_map[field])
+	output_to_save = output_to_save[["datetime_utc", *selected_columns]]
+	required_columns = selected_columns
+	output_to_save = output_to_save.dropna(subset=required_columns, how="all")
 
 	pre_clean_df = output_to_save.copy()
-	post_clean_df = pre_clean_df.dropna(subset=TICKERS, how="any")
+	post_clean_df = pre_clean_df.dropna(subset=required_columns, how="any")
+	removed_rows = len(pre_clean_df) - len(post_clean_df)
 
 	pre_clean_file.write_text(render_table_text(pre_clean_df, "Pre_clean"), encoding="utf-8")
 	post_clean_file.write_text(render_table_text(post_clean_df, "Post_clean"), encoding="utf-8")
@@ -438,6 +602,11 @@ def main() -> None:
 		),
 		encoding="utf-8",
 	)
+
+	print(f"Righe Pre_clean: {len(pre_clean_df)}")
+	print(f"Righe Post_clean: {len(post_clean_df)}")
+	print(f"Righe eliminate: {removed_rows}")
+	print(f"Campi dataset: {', '.join(selected_fields)}")
 
 	print(f"Pre_clean salvato in: {pre_clean_file}")
 	print(f"Post_clean salvato in: {post_clean_file}")
